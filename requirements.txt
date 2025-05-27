@@ -1,0 +1,13 @@
+﻿fastapi
+uvicorn
+python-multipart
+opencv-python
+numpy
+pillow
+natsort
+pydantic
+python-dotenv
+aiofiles
+onnxruntime-directml==1.17.3
+psutil
+GPUtil
