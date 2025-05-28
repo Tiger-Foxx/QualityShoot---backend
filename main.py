@@ -8,6 +8,17 @@ from pathlib import Path
 from api.routes import upscale, files
 from core.config import settings
 from core.exceptions import QualityShootException, create_http_exception
+import sys
+from api.routes import shutdown
+
+
+# Patch pour PyInstaller --noconsole (empêche le crash logging)
+if sys.stdout is None:
+    import io
+    sys.stdout = io.StringIO()
+if sys.stderr is None:
+    import io
+    sys.stderr = io.StringIO()
 
 # Configuration logging
 logging.basicConfig(
@@ -38,6 +49,7 @@ app.mount("/static", StaticFiles(directory=str(settings.TEMP_DIR)), name="static
 # Inclusion des routes
 app.include_router(upscale.router, prefix="/api/upscale", tags=["upscale"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
+app.include_router(shutdown.router)
 
 # Gestionnaire d'exceptions global
 @app.exception_handler(QualityShootException)
