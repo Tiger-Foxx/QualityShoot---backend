@@ -7,15 +7,17 @@ router = APIRouter()
 
 @router.post("/shutdown-instant")
 def shutdown_and_cleanup():
-    # 1. Vider le dossier temp (attention à ne pas supprimer des fichiers critiques)
+    # 1. Vider le dossier temp (sauf les fichiers ayant une extension .txt)
     temp_dir = os.path.join(os.path.dirname(__file__), "..", "..", "temp")
     temp_dir = os.path.abspath(temp_dir)
     if os.path.exists(temp_dir):
         for filename in os.listdir(temp_dir):
             file_path = os.path.join(temp_dir, filename)
             try:
+                # Ne supprime pas les fichiers .txt
                 if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)
+                    if not file_path.lower().endswith('.txt'):
+                        os.unlink(file_path)
                 elif os.path.isdir(file_path):
                     shutil.rmtree(file_path)
             except Exception as e:
