@@ -1,8 +1,6 @@
 ﻿import asyncio
 import logging
 import os
-import tempfile
-import shutil
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 import uuid
@@ -19,32 +17,53 @@ from api.models.requests import UpscaleRequest
 from api.models.responses import ProcessStatus
 from core.config import settings
 import traceback
+import unicodedata
+def slugify(value):
+    value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+    return ''.join(c if c.isalnum() else '_' for c in value)
 
 logger = logging.getLogger(__name__)
+
+def safe_image_write(file_path, image, ext=".jpg"):
+    """
+    Robust image write, encoding first then writing to file (better for Windows/accents).
+    """
+    try:
+        result, encoded_img = cv2.imencode(ext, image)
+        if result:
+            encoded_img.tofile(file_path)
+            return True
+        logger.error(f"[safe_image_write] cv2.imencode a échoué pour {file_path}")
+        return False
+    except Exception as e:
+        logger.error(f"[safe_image_write] Exception lors de imencode/tofile: {e} (chemin: {file_path})")
+        return False
 
 class VideoProcessor:
     def __init__(self):
         self.active_processes: Dict[str, Dict[str, Any]] = {}
         self.ffmpeg_path = settings.ASSETS_DIR / "ffmpeg" / "ffmpeg.exe"
-    
+
     async def process_videos(
         self,
         request: UpscaleRequest,
         process_id: Optional[str] = None,
         progress_callback: Optional[callable] = None
     ) -> str:
-        """Traite une liste de vidéos"""
+        """
+        Traite une liste de vidéos, en lançant l'extraction, l'upscaling et l'encodage FFmpeg.
+        """
         if not process_id:
             process_id = str(uuid.uuid4())
 
-        # Filtrer les vidéos seulement
+        logger.info(f"[process_videos] Démarrage pour process_id={process_id}")
+
         from utils.file_utils import is_video_file
         video_paths = [path for path in request.file_paths if is_video_file(path)]
-        
         if not video_paths:
+            logger.warning("[process_videos] Aucun fichier vidéo valide trouvé dans la liste fournie")
             raise ProcessingError("Aucun fichier vidéo valide trouvé")
-        
-        # Initialiser le processus
+
         self.active_processes[process_id] = {
             'status': ProcessStatus.PROCESSING,
             'progress': 0.0,
@@ -56,9 +75,7 @@ class VideoProcessor:
             'error_message': None,
             'estimated_time_remaining': None
         }
-        
         try:
-            # Créer l'upscaler multi-thread
             upscaler = MultiThreadAIUpscaler(
                 num_threads=request.multithreading,
                 model_name=request.ai_model.value,
@@ -67,21 +84,18 @@ class VideoProcessor:
                 output_resize_factor=request.output_resize_factor,
                 max_resolution=int(request.vram_limit * 100)
             )
-            
-            # Traiter chaque vidéo
+            logger.info(f"[process_videos] Upscaler initialisé avec modèle={request.ai_model.value}")
+
             for i, video_path in enumerate(video_paths):
+                self.active_processes[process_id].update({
+                    'current_file': Path(video_path).name,
+                    'progress': (i / len(video_paths)) * 100,
+                    'current_step': f'Traitement vidéo {i+1}/{len(video_paths)}'
+                })
+                logger.info(f"[process_videos] Traitement vidéo: {video_path}")
                 try:
-                    # Mettre à jour le statut
-                    self.active_processes[process_id].update({
-                        'current_file': Path(video_path).name,
-                        'progress': (i / len(video_paths)) * 100,
-                        'current_step': 'Traitement vidéo'
-                    })
-                    
                     if progress_callback and callable(progress_callback):
                         await progress_callback(process_id, self.active_processes[process_id])
-                    
-                    # Traitement de la vidéo
                     await self._process_single_video(
                         video_path,
                         upscaler,
@@ -89,31 +103,30 @@ class VideoProcessor:
                         process_id,
                         progress_callback
                     )
-                    
                     self.active_processes[process_id]['completed_files'].append(video_path)
-                    
+                    logger.info(f"[process_videos] Vidéo traitée (succès) : {video_path}")
                 except Exception as e:
-                    logger.error(f"Erreur traitement {video_path}: {e}")
+                    logger.error(f"[process_videos] Erreur traitement {video_path}: {e}")
                     traceback.print_exc()
                     self.active_processes[process_id]['failed_files'].append(video_path)
-            
-            # Finaliser
+
             self.active_processes[process_id].update({
                 'status': ProcessStatus.COMPLETED,
                 'progress': 100.0,
                 'current_file': None,
                 'current_step': 'Terminé'
             })
-            
+            logger.info(f"[process_videos] Tous les traitements terminés pour process_id={process_id}")
             return process_id
-            
+
         except Exception as e:
+            logger.error(f"[process_videos] Exception générale: {e}")
             self.active_processes[process_id].update({
                 'status': ProcessStatus.ERROR,
                 'error_message': str(e)
             })
             raise ProcessingError(f"Erreur lors du traitement des vidéos: {e}")
-    
+
     async def _process_single_video(
         self,
         video_path: str,
@@ -122,35 +135,31 @@ class VideoProcessor:
         process_id: str,
         progress_callback: Optional[callable] = None
     ) -> None:
-        """Traite une seule vidéo"""
+        """
+        Traite une seule vidéo: extraction, upscaling, reconstruction.
+        """
         temp_dir = None
         try:
-            # Créer répertoire temporaire
-            temp_dir = create_temp_directory(f"video_{Path(video_path).stem}_")
-            
-            # Obtenir infos vidéo
+            stem = slugify(Path(video_path).stem)
+            temp_dir = create_temp_directory(f"video_{stem}_")
+            logger.info(f"[single_video] Temp dir créé: {temp_dir}")
             video_info = get_video_info(video_path)
-            
-            # Étape 1: Extraction des frames
+            logger.info(f"[single_video] Infos vidéo: {video_info}")
+
             self.active_processes[process_id]['current_step'] = 'Extraction des frames'
             frame_paths = await self._extract_frames(video_path, temp_dir, progress_callback, process_id)
             if not frame_paths:
+                logger.error(f"[single_video] Extraction: aucune frame extraite pour {video_path}")
                 raise ProcessingError(f"Aucune frame extraite de la vidéo {video_path}. Le fichier est peut-être corrompu ou non pris en charge.")
-            
-            # Étape 2: Upscaling des frames
+
             self.active_processes[process_id]['current_step'] = 'Upscaling des frames'
             upscaled_frame_paths = await self._upscale_frames(
-                frame_paths, 
-                upscaler, 
-                request, 
-                temp_dir,
-                progress_callback,
-                process_id
+                frame_paths, upscaler, request, temp_dir, progress_callback, process_id
             )
             if not upscaled_frame_paths:
+                logger.error(f"[single_video] Upscaling: aucune frame upscalée générée pour {video_path}")
                 raise ProcessingError(f"Aucune frame upscalée générée pour la vidéo {video_path}.")
-            
-            # Étape 3: Reconstruction vidéo
+
             self.active_processes[process_id]['current_step'] = 'Reconstruction vidéo'
             output_path = prepare_output_path(
                 input_path=video_path,
@@ -161,7 +170,8 @@ class VideoProcessor:
                 blending=request.blending.value,
                 extension=request.video_extension
             )
-            
+            logger.info(f"[single_video] Reconstruction vidéo: output_path={output_path}")
+
             await self._encode_video(
                 video_path,
                 output_path,
@@ -171,96 +181,73 @@ class VideoProcessor:
                 progress_callback,
                 process_id
             )
-            
-            # Nettoyer les frames si demandé
             if not request.keep_frames and temp_dir:
                 cleanup_temp_directory(temp_dir)
-            
-            logger.info(f"Vidéo traitée avec succès: {output_path}")
-            
+                logger.info(f"[single_video] Temp dir nettoyé: {temp_dir}")
+            logger.info(f"[single_video] Vidéo traitée avec succès: {output_path}")
         except Exception as e:
             if temp_dir:
                 cleanup_temp_directory(temp_dir)
-            logger.error(f"Erreur traitement vidéo {video_path}: {e}")
+            logger.error(f"[single_video] Erreur traitement vidéo {video_path}: {e}")
             raise
-    
+
     async def _extract_frames(
-        self, 
-        video_path: str, 
+        self,
+        video_path: str,
         temp_dir: str,
         progress_callback: Optional[callable],
         process_id: str
     ) -> List[str]:
-        """Extrait les frames d'une vidéo"""
+        """
+        Extrait les frames d'une vidéo en mode thread, robustesse maximale.
+        """
         frame_paths = []
-        
         def extract_sync():
-            # SÉCURITÉ: Création du dossier si pas existant
             os.makedirs(temp_dir, exist_ok=True)
-
             cap = cv2.VideoCapture(str(video_path))
             if not cap.isOpened():
-                logger.error(f"[OpenCV] Impossible d'ouvrir la vidéo source : {video_path}")
-                raise ProcessingError(f"Impossible d'ouvrir la vidéo source : {video_path}")
+                logger.error(f"[extract_sync] Impossible d'ouvrir la vidéo source: {video_path}")
+                raise ProcessingError(f"Impossible d'ouvrir la vidéo source: {video_path}")
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            logger.info(f"[extract_sync] Nombre de frames détectées: {frame_count}")
             cpu_cores = cpu_count()
-            frames_to_extract = cpu_cores * 30  # 30 frames par core
-
+            frames_to_extract = max(cpu_cores * 30, 1)
             frames_extracted = []
             frame_index = 0
 
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    logger.error(f"[OpenCV] Fin de lecture ou lecture frame échouée à l'index {frame_index} sur {frame_count} frames.")
+                    if frame_index < frame_count:
+                        logger.warning(f"[extract_sync] Fin prématurée de lecture à la frame {frame_index}/{frame_count}")
                     break
-
                 frame_path = os.path.normpath(os.path.join(temp_dir, f"frame_{frame_index:06d}.jpg"))
-                # LOG: Vérifie l'existence du dossier
-                if not os.path.isdir(os.path.dirname(frame_path)):
-                    logger.error(f"Le dossier pour frame {frame_index} n'existe pas: {os.path.dirname(frame_path)}")
-                write_ok = cv2.imwrite(frame_path, frame)
-                if write_ok:
-                    frames_extracted.append(frame_path)
-                else:
-                    logger.error(f"[OpenCV] Échec écriture frame {frame_index} dans {frame_path} (chemin existant ? permissions ?)")
-                    logger.error(f"Chemin absolu: {os.path.abspath(frame_path)} | Dossier existe: {os.path.isdir(os.path.dirname(frame_path))}")
                 try:
-                    write_ok = cv2.imwrite(frame_path, frame)
+                    write_ok = safe_image_write(frame_path, frame, ".jpg")
                     if write_ok:
                         frames_extracted.append(frame_path)
                     else:
-                        logger.error(f"Erreur lors de la sauvegarde de la frame {frame_index} dans {frame_path}")
+                        logger.error(f"[extract_sync] Erreur sauvegarde frame {frame_index} dans {frame_path}")
                 except Exception as ex:
-                    logger.error(f"Erreur exception lors de la sauvegarde de la frame {frame_index}: {ex}")
-
-                # Sauvegarder par batch
+                    logger.error(f"[extract_sync] Exception sauvegarde frame {frame_index}: {ex}")
                 if len(frames_extracted) >= frames_to_extract:
                     frame_paths.extend(frames_extracted)
                     frames_extracted = []
-                    
-                    # Mettre à jour progression
                     progress = (frame_index / frame_count) * 100 if frame_count else 0
                     if process_id in self.active_processes:
-                        self.active_processes[process_id]['progress'] = progress * 0.3  # 30% pour extraction
-                
+                        self.active_processes[process_id]['progress'] = progress * 0.3
                 frame_index += 1
-            
-            # Ajouter les frames restantes
             frame_paths.extend(frames_extracted)
             cap.release()
-            
+            logger.info(f"[extract_sync] Nombre total de frames extraites: {len(frame_paths)}")
             return frame_paths
-        
-        # Exécuter dans un thread séparé
         loop = asyncio.get_event_loop()
         frame_paths = await loop.run_in_executor(None, extract_sync)
         if not frame_paths:
-            logger.error(f"Aucune frame extraite pour {video_path} (chemin: {temp_dir})")
+            logger.error(f"[extract_frames] Extraction: aucune frame extraite (chemin: {temp_dir})")
             raise ProcessingError(f"Aucune frame extraite de la vidéo {video_path}. Le fichier est peut-être corrompu ou non pris en charge.")
-        # Loguer les chemins pour debug
         for p in frame_paths[:3]:
-            logger.debug(f"Frame extraite: {p}")
+            logger.debug(f"[extract_frames] Frame extraite: {p}")
         return frame_paths
 
     async def _upscale_frames(
@@ -272,89 +259,77 @@ class VideoProcessor:
         progress_callback: Optional[callable],
         process_id: str
     ) -> List[str]:
-        """Upscale les frames de la vidéo"""
+        """
+        Upscale toutes les frames extraites, robustesse et logs détaillés.
+        """
         upscaled_paths = []
-        
-        # Calculer la capacité GPU
         if frame_paths:
             try:
                 test_img = image_read(frame_paths[0])
                 if test_img is None:
-                    logger.error(f"Erreur calcul capacité: Impossible de lire {frame_paths[0]}")
+                    logger.error(f"[upscale_frames] Impossible de lire {frame_paths[0]} pour calcul capacité")
                     capacity = 1
                 else:
                     capacity = upscaler.calculate_frames_capacity(frame_paths[0])
             except Exception as e:
-                logger.warning(f"Erreur calcul capacité: {e}")
+                logger.warning(f"[upscale_frames] Erreur calcul capacité: {e}")
                 capacity = 1
         else:
             capacity = 1
-        
         effective_threads = min(capacity, request.multithreading)
+        logger.info(f"[upscale_frames] Traitement en {effective_threads} threads")
 
         def process_frame_batch(frame_batch, thread_id):
             upscaler_instance = upscaler.get_upscaler(thread_id)
             batch_results = []
-            
             for frame_path in frame_batch:
                 try:
                     frame = image_read(frame_path)
                     if frame is None:
-                        logger.error(f"Frame non lisible: {frame_path}")
+                        logger.error(f"[upscale_frames] Frame non lisible: {frame_path}")
                         batch_results.append(None)
                         continue
-
                     upscaled_frame = upscaler_instance.process_image(frame)
-                    
-                    # Blending si nécessaire
                     if request.blending.value != "OFF":
                         blend_factors = {"Low": 0.3, "Medium": 0.5, "High": 0.7}
                         blend_factor = blend_factors.get(request.blending.value, 0.0)
                         final_frame = blend_images(frame, upscaled_frame, blend_factor)
                     else:
                         final_frame = upscaled_frame
-                    
-                    # Sauvegarder
                     frame_name = Path(frame_path).stem
                     output_path = os.path.join(temp_dir, f"{frame_name}_upscaled.jpg")
-                    image_write(output_path, final_frame, ".jpg")
-                    batch_results.append(output_path)
-                    
+                    write_ok = safe_image_write(output_path, final_frame, ".jpg")
+                    if write_ok:
+                        batch_results.append(output_path)
+                    else:
+                        logger.error(f"[upscale_frames] Erreur sauvegarde frame upscalée: {output_path}")
+                        batch_results.append(None)
                 except Exception as e:
-                    logger.error(f"Erreur frame {frame_path}: {e}")
+                    logger.error(f"[upscale_frames] Exception sur {frame_path}: {e}")
                     batch_results.append(None)
-            
             return batch_results
-        
-        # Diviser les frames en batches
+
         batch_size = len(frame_paths) // effective_threads if effective_threads else len(frame_paths)
         if batch_size == 0:
             batch_size = 1
-        
         batches = [frame_paths[i:i + batch_size] for i in range(0, len(frame_paths), batch_size)]
-        
-        # Traitement parallèle
         loop = asyncio.get_event_loop()
         with ThreadPoolExecutor(max_workers=effective_threads) as executor:
             tasks = [
                 loop.run_in_executor(executor, process_frame_batch, batch, i)
                 for i, batch in enumerate(batches)
             ]
-            
-            # Traiter avec mise à jour de progression
             for i, task in enumerate(asyncio.as_completed(tasks)):
                 batch_results = await task
                 upscaled_paths.extend([p for p in batch_results if p])
-                
-                # Mettre à jour progression (30-80% pour upscaling)
                 progress = 30 + ((i + 1) / len(tasks)) * 50
                 if process_id in self.active_processes:
                     self.active_processes[process_id]['progress'] = progress
-
+        logger.info(f"[upscale_frames] Nombre total de frames upscalées: {len(upscaled_paths)}")
         if not upscaled_paths:
-            logger.error("Aucun frame upscalé généré.")
+            logger.error("[upscale_frames] Aucun frame upscalé généré.")
         return sorted(upscaled_paths)
-    
+
     async def _encode_video(
         self,
         original_video_path: str,
@@ -365,34 +340,33 @@ class VideoProcessor:
         progress_callback: Optional[callable],
         process_id: str
     ) -> None:
-        """Encode la vidéo finale"""
+        """
+        Reconstruction vidéo avec FFmpeg, robustesse maximale (chemins, logs, verifs).
+        """
         if not self.ffmpeg_path.exists():
+            logger.error("[encode_video] FFmpeg non trouvé")
             raise ProcessingError("FFmpeg non trouvé")
-        
         if not frame_paths:
+            logger.error("[encode_video] Aucun frame à encoder pour la vidéo")
             raise ProcessingError("Aucune frame upscalée à encoder pour la vidéo.")
-        
-        # Préparer les chemins
+
         frames_list_path = os.path.join(Path(frame_paths[0]).parent, "frames_list.txt")
         temp_video_path = output_path.replace(Path(output_path).suffix, "_temp.mp4")
-        
+        logger.info(f"[encode_video] frames_list_path={frames_list_path}")
         try:
-            # Créer liste des frames
+            # Ecriture frames_list.txt avec chemins POSIX/robustes
             with open(frames_list_path, 'w', encoding='utf-8') as f:
                 for frame_path in frame_paths:
-                    f.write(f"file '{frame_path}'\n")
-            
-            # Mapper les codecs
-            codec_map = {
-                "x264": "libx264",
-                "x265": "libx265"
-            }
+                    abs_path = os.path.abspath(frame_path).replace("\\", "/")
+                    f.write(f"file '{abs_path}'\n")
+            logger.info(f"[encode_video] Premieres lignes frames_list.txt: " +
+                "".join([f"file '{os.path.abspath(frame_paths[i]).replace(chr(92), '/')}'\n" for i in range(min(5, len(frame_paths)))]))
+
+            codec_map = {"x264": "libx264", "x265": "libx265"}
             actual_codec = codec_map.get(codec, codec)
-            
-            # Commande FFmpeg pour créer vidéo sans audio
             cmd_video = [
                 str(self.ffmpeg_path),
-                "-y", "-loglevel", "error",
+                "-y", "-loglevel", "info",  # "info" pour logs détaillés
                 "-f", "concat", "-safe", "0",
                 "-r", str(video_info['fps']),
                 "-i", frames_list_path,
@@ -402,23 +376,23 @@ class VideoProcessor:
                 "-b:v", "12000k",
                 temp_video_path
             ]
-            
-            # Exécuter encodage vidéo
+            logger.info(f"[encode_video] Commande FFmpeg (vidéo): {' '.join(cmd_video)}")
+
             process = await asyncio.create_subprocess_exec(
                 *cmd_video,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            
-            await process.communicate()
-            
+            stdout, stderr = await process.communicate()
             if process.returncode != 0:
+                logger.error(f"[encode_video] FFmpeg erreur vidéo: {stderr.decode(errors='replace')}")
                 raise ProcessingError("Erreur lors de l'encodage vidéo")
-            
-            # Ajouter l'audio de la vidéo originale
+            logger.info(f"[encode_video] Vidéo sans audio encodée avec succès: {temp_video_path}")
+
+            # Ajout audio
             cmd_audio = [
                 str(self.ffmpeg_path),
-                "-y", "-loglevel", "error",
+                "-y", "-loglevel", "info",
                 "-i", original_video_path,
                 "-i", temp_video_path,
                 "-c:v", "copy",
@@ -427,44 +401,49 @@ class VideoProcessor:
                 "-c:a", "copy",
                 output_path
             ]
-            
+            logger.info(f"[encode_video] Commande FFmpeg (audio): {' '.join(cmd_audio)}")
             process = await asyncio.create_subprocess_exec(
                 *cmd_audio,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            
-            await process.communicate()
-            
-            # Nettoyer fichier temporaire
+            stdout, stderr = await process.communicate()
+            if process.returncode != 0:
+                logger.error(f"[encode_video] FFmpeg erreur audio: {stderr.decode(errors='replace')}")
+                raise ProcessingError("Erreur lors de l'encodage vidéo (audio)")
+            logger.info(f"[encode_video] Vidéo finale encodée avec succès: {output_path}")
+
             if os.path.exists(temp_video_path):
                 os.remove(temp_video_path)
             if os.path.exists(frames_list_path):
                 os.remove(frames_list_path)
-            
-            # Mettre à jour progression finale
             if process_id in self.active_processes:
                 self.active_processes[process_id]['progress'] = 100.0
-            
+
         except Exception as e:
-            # Nettoyer en cas d'erreur
+            logger.error(f"[encode_video] Exception: {e}")
+            # Nettoyage fichiers temporaires
             for temp_file in [temp_video_path, frames_list_path]:
                 if os.path.exists(temp_file):
-                    os.remove(temp_file)
+                    try:
+                        os.remove(temp_file)
+                    except Exception as ex:
+                        logger.warning(f"[encode_video] Impossible de supprimer {temp_file} : {ex}")
             raise ProcessingError(f"Erreur encodage: {e}")
-    
+
     def get_process_status(self, process_id: str) -> Optional[Dict[str, Any]]:
-        """Récupère le statut d'un processus"""
+        logger.debug(f"[get_process_status] process_id={process_id}")
         return self.active_processes.get(process_id)
-    
+
     def cancel_process(self, process_id: str) -> bool:
-        """Annule un processus"""
         if process_id in self.active_processes:
             self.active_processes[process_id]['status'] = ProcessStatus.CANCELLED
+            logger.info(f"[cancel_process] Processus annulé: {process_id}")
             return True
+        logger.info(f"[cancel_process] Processus non trouvé: {process_id}")
         return False
-    
+
     def cleanup_process(self, process_id: str) -> None:
-        """Nettoie un processus terminé"""
         if process_id in self.active_processes:
+            logger.info(f"[cleanup_process] Nettoyage processus: {process_id}")
             del self.active_processes[process_id]
